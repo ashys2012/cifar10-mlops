@@ -257,6 +257,6 @@ To ensure our model remains secure against malicious inputs, we must address its
 
 ## Further work (given more time)
 
-- **Containerisation** — Dockerfile + docker-compose so the server and MLflow UI run together with a single `docker compose up`
+- **Containerisation** — Dockerfile implementaion`
 - **Prometheus + Grafana** — structured metrics for prediction distribution, latency percentiles, and error rates
 - **Hyperparameter Tuning** - By using the optuna or the hyperopts library
