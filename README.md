@@ -1,10 +1,10 @@
 # CIFAR-10 Image Classifier — ResNet18 + ZenML + MLflow + FastAPI
 
-A production-style image classification system for the CIFAR-10 dataset. The goal was not just to train a model, but to engineer a clean, reproducible, and extensible ML system — with a tracked training pipeline, a model registry, and a served REST API.
+An end-to-end image classification system for the CIFAR-10 dataset.
 
 ---
 
-## What's in here
+File Structure
 
 ```
 cifar_10/
@@ -27,14 +27,14 @@ cifar_10/
 
 ## Architecture decisions
 
-### Why ResNet18 and not a custom CNN?
-CIFAR-10 is a solved benchmark. The task explicitly says we are not being tested on whether we can train a CNN — we are being tested on **engineering quality**. ResNet18 pretrained on ImageNet gives a strong baseline immediately, and transfer learning is the correct production approach for a 10-class image dataset of this size. The final classification head is replaced with a new linear layer matching the 10 CIFAR-10 classes.
+### Why ResNet18?
+ResNet18 pretrained on ImageNet gives a strong baseline immediately, and transfer learning is the correct production approach for a 10-class image dataset of this size. The final classification head is replaced with a new linear layer matching the 10 CIFAR-10 classes.
 
 ### Why ZenML for the pipeline?
-ZenML gives each training run automatic artifact versioning, step-level caching, and a lineage graph — things you would build by hand otherwise. The data loading step is cached (CIFAR-10 is a fixed public dataset), so re-running the pipeline only re-executes training and evaluation. Each run links through to its MLflow experiment automatically.
+ZenML gives each training run automatic artifact versioning, step-level caching, and a lineage graph, things you would build by hand otherwise. The data loading step is cached (CIFAR-10 is a fixed public dataset), so re-running the pipeline only re-executes training and evaluation. Each run links through to its MLflow experiment automatically.
 
 ### Why SQLite for MLflow?
-The file-store backend (`mlruns/`) was deprecated in recent MLflow versions and no longer supports the Model Registry. SQLite is the correct local backend — it supports the full registry API (register, alias, stage promotion) with no extra infrastructure.
+The file-store backend (`mlruns/`) was deprecated in recent MLflow versions and no longer supports the Model Registry. SQLite is the correct local backend as it supports the full registry API.
 
 ### Why the Model Registry?
 Hardcoding a run ID into the server is fragile — it breaks every time you retrain. The MLflow Model Registry decouples training from serving: the server always loads the model aliased `champion`, and promoting a new model is a one-line registry operation, not a code change.
@@ -44,7 +44,7 @@ Hardcoding a run ID into the server is fragile — it breaks every time you retr
 ## Setup
 
 ### Prerequisites
-- Python 3.12 (3.13 has known compatibility issues with some dependencies — stick to 3.12)
+- Python 3.12
 - [`uv`](https://github.com/astral-sh/uv) for environment and dependency management
 - A GPU is optional — the server and training loop both fall back to CPU
 
@@ -153,7 +153,7 @@ This means the server works immediately after training, even before you've touch
 | `POST` | `/predict` | Upload an image → returns top predicted class |
 | `POST` | `/predict_with_confidence` | Upload an image → returns top-k classes with confidence scores |
 
-Interactive docs (try it in the browser): **http://localhost:8000/docs**
+Interactive docs: **http://localhost:8000/docs**
 
 ### Example request
 
@@ -218,53 +218,32 @@ The test suite covers:
 
 ### 1. Out-of-distribution images — how does the model handle them, and how could it indicate "unknown"?
 
-ResNet18 with a softmax head always produces a probability distribution that sums to 1.0, even for completely unrelated inputs (a photo of furniture, a medical scan, pure noise). The model is forced to pick one of its 10 classes regardless of how dissimilar the input is to anything it was trained on — it has no concept of "I don't recognise this".
+ResNet18 with a softmax head always produces a probability distribution that sums to 1.0, even for completely unrelated inputs (a photo of furniture, a medical scan, etc.). The model is forced to pick one of its 10 classes regardless of how dissimilar the input is to anything it was trained on; it has no concept of "I don't recognise this". For example, I added an X-ray image to the api and it predicted with 59% confidence that it is an automobile. 
+To mitigate this issue, we can add a threshold (for example 60%) and if the confidence threshold is below 60%, then it should be classed as unknown.
 
-**Current partial mitigation:** the `/predict_with_confidence` endpoint exposes the top-k softmax scores. A caller can apply a confidence threshold (e.g. reject if `max(softmax) < 0.6`) as a simple heuristic — genuinely uncertain inputs tend to produce flatter distributions.
-
-**Better approaches:**
-- **Temperature scaling** — a single learned scalar `T` applied before softmax that makes the model better-calibrated without retraining. Confidence scores become more meaningful as a proxy for correctness.
-- **Energy-based OOD detection** — compute `E(x) = -log Σ exp(logit_i)`. In-distribution inputs cluster at lower energy; OOD inputs have measurably higher energy. This can be thresholded without any retraining.
+**Alternate approaches:**
 - **A dedicated "unknown" class** — collect a diverse set of non-CIFAR-10 images, add an 11th class, and fine-tune. The model then has an explicit bucket for out-of-distribution inputs.
-- **`/predict` returning a structured rejection** — rather than always returning a class, add a `rejected: true` field when confidence is below threshold, so callers handle it explicitly rather than silently trusting a bad prediction.
-
 ---
 
 ### 2. Preparing for scale — batching and queuing
 
-The current server processes one image per request synchronously. Under high load this has two problems: requests queue at the HTTP layer, and the GPU is underutilised (most of each forward pass is spent on overhead rather than compute, because batch size is 1).
+1. To address the performance bottlenecks of the current synchronous inference server, we can optimise the architecture by focusing on asynchronous task handling, throughput optimisation, and infrastructure scalability
+The API accepts the request and immediately returns a job_id. The inference task is pushed to a background worker pool and once completed, notifies the user.
 
-**Request queuing:** put the server behind a message queue (Redis + Celery, or AWS SQS). Clients POST an image and receive a job ID immediately; a worker picks it up, runs inference, and writes the result. Clients poll `/result/{job_id}` or receive a webhook. This decouples client latency from inference latency entirely.
-
-**Dynamic batching:** collect incoming requests over a short window (e.g. 20ms) and run a single forward pass on the batch. A batch of 32 images takes only slightly longer than a batch of 1 on a GPU, so throughput increases dramatically. Libraries like NVIDIA Triton Inference Server implement this natively. A simpler DIY version: a background thread drains a queue, accumulates images until the batch is full or the timeout fires, runs inference, and maps results back to waiting futures.
-
-**Horizontal scaling:** run multiple server replicas behind a load balancer (nginx, or a Kubernetes Service). Each replica loads its own copy of the model. For GPU deployments, one replica per GPU is the right unit.
-
+2. If the inference is deployed on a Kubernetes cluster, we can add horizontal scaling (for example, we can use Ray Serve). Ray serve can dynamically scale the number of inference replicas based on the current traffic, ensuring optimal resource utilisation and availability across the cluster. 
 ---
 
 ### 3. Feedback loop for unknown classes
 
 If the endpoint receives a growing volume of low-confidence or rejected predictions, that signal should feed back into the model rather than being silently discarded.
 
-**Proposed pipeline:**
-1. Log every rejected prediction (image hash, timestamp, top confidence score) to a database table.
-2. Build a lightweight review queue — a human labels a sample of flagged images (or a secondary, higher-capacity model does a first pass).
-3. Once enough labelled examples accumulate, trigger a retraining run via the existing ZenML pipeline, now with the new examples included in the training set.
-4. The retrained model goes through the normal registration flow — `register_best_run.py` promotes it to `champion` only if it beats the current champion's validation accuracy.
-
-This is **active learning**: the production system surfaces its own blind spots, and the feedback loop closes them systematically rather than waiting for someone to notice a problem.
+To improve model accuracy over time, we will implement a "human-in-the-loop" workflow to handle edge cases. Any predictions where the model has low confidence will be automatically flagged and stored in a review database. A human expert will then inspect these samples to provide the correct label or tag them as "unknown" if they fall outside the standard CIFAR-10 classes. Once a sufficient number of these reviewed samples have been collected, the system will automatically trigger a pipeline to retrain the model with the new data, ensuring it continuously learns and evolves to handle difficult scenarios.
 
 ---
 
 ### 4. Detecting drift and performance degradation
 
-**Prediction distribution drift:** log the predicted class for every request. In steady state, the distribution of predictions should be roughly stable. If "ship" suddenly accounts for 40% of predictions when it was historically 10%, that's a signal — either the input distribution has shifted, or the model has degraded. Population Stability Index (PSI) is the standard metric for this.
-
-**Confidence drift:** log the max softmax score per request. A falling average confidence over time (without a corresponding rise in explicit rejections) suggests the model is becoming less certain — possibly because inputs are drifting away from the training distribution.
-
-**Latency and error rates:** expose a `/metrics` endpoint (Prometheus format) tracking request count, error count by status code, and inference latency percentiles (p50, p95, p99). Wire this into Grafana with alerts on error rate > 1% or p99 latency > 500ms.
-
-**Ground truth comparison (where possible):** if a downstream system eventually produces a label for a prediction (e.g. a user corrects a wrong classification), log prediction vs. ground truth. Track rolling accuracy over a sliding window and alert if it drops below a threshold.
+We will implement proactive monitoring for prediction and confidence drift to detect when the model’s environment changes. By logging the distribution of predicted classes and the average softmax confidence scores, we can identify anomalies—such as a sudden surge in a specific class or a downward trend in certainty—that signal the input data is shifting away from the training distribution. We will use statistical methods to quantify these shifts, allowing us to distinguish between normal fluctuations and genuine model degradation.
 
 ---
 
@@ -272,29 +251,12 @@ This is **active learning**: the production system surfaces its own blind spots,
 
 A standard ResNet trained on clean images is brittle to adversarial examples — imperceptible perturbations to pixel values that cause confident wrong predictions. This is a known property of softmax classifiers, not a bug specific to this implementation.
 
-**Demonstrating the vulnerability:**
-```python
-# pip install torchattacks
-import torchattacks
-atk = torchattacks.PGD(model, eps=8/255, alpha=2/255, steps=10)
-adv_image = atk(image_tensor, true_label)
-# model(adv_image) will likely predict the wrong class with high confidence
-```
-PGD (Projected Gradient Descent) is the standard benchmark attack. Measuring accuracy on PGD-attacked CIFAR-10 test images gives a meaningful robustness score.
-
-**Defences:**
-- **Adversarial training** — include adversarial examples in the training set (generated on-the-fly during each epoch). This is the most effective known defence but increases training time by 3–5×.
-- **Input preprocessing** — JPEG compression, Gaussian smoothing, or feature squeezing before the forward pass destroys many adversarial perturbations at low cost.
-- **Certified defences** — randomised smoothing (Cohen et al. 2019) provides a provable robustness guarantee: for any input within an L2 ball of radius r, the prediction is certified correct. This comes at an accuracy cost on clean inputs.
-
-In a production system, adversarial inputs are best treated as a subset of the OOD problem — both are inputs the model was not designed for, and the same confidence-thresholding and logging infrastructure catches them.
+To ensure our model remains secure against malicious inputs, we must address its vulnerability to "adversarial examples"—images with tiny, invisible pixel changes designed to trick the model into making confident errors. To mitigate these risks, we can employ techniques like adversarial training, where the model learns to ignore these perturbations, or simple input preprocessing like smoothing to filter out noise. Ultimately, we treat these adversarial attacks as a form of "out-of-distribution" data, ensuring that any input the model wasn't trained to handle is either flagged or filtered to maintain system integrity.
 
 ---
 
 ## Further work (given more time)
 
 - **Containerisation** — Dockerfile + docker-compose so the server and MLflow UI run together with a single `docker compose up`
-- **CI pipeline** — GitHub Actions: lint → unit tests → 1-epoch smoke-test run → register if accuracy threshold met
-- **Grad-CAM `/explain` endpoint** — return a heatmap image overlaid on the input showing which pixels drove the prediction (addresses explainability)
-- **Async model hot-swap** — background thread polls the registry every N minutes; if a new `champion` is found, reload the model without restarting the server
 - **Prometheus + Grafana** — structured metrics for prediction distribution, latency percentiles, and error rates
+- **Hyperparameter Tuning** - By using the optuna or the hyperopts library
