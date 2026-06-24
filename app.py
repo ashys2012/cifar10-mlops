@@ -80,7 +80,7 @@ PREPROCESS = transforms.Compose([
 # ---------------------------------------------------------------------------
 _model:     torch.nn.Module | None = None
 _device:    torch.device    | None = None
-_model_uri: str             | None = None   # resolved URI, exposed via /metadata
+_model_uri: str             | None = None 
 
 
 # ---------------------------------------------------------------------------
