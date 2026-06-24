@@ -1,0 +1,29 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+cifar-10-venv/
+
+# MLflow data and tracking
+mlflow.db
+mlruns/
+.mlflow/
+
+# ZenML local store
+.zen/
+
+# Data directory
+data/
+
+# IDE and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Large files
+*.zip
+*.tar.gz
+
